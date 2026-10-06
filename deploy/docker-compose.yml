@@ -1,0 +1,28 @@
+# Runs on the EC2 server in /home/ubuntu/app.
+# Images are built and pushed to ECR by the GitHub Actions pipelines of
+# y-demo-backend and y-demo-frontend; deploy.sh pulls and restarts them.
+# ECR_REGISTRY comes from /home/ubuntu/app/.env, DB settings from backend.env.
+name: todo
+
+services:
+  # One-off job: creates the database and runs Sequelize migrations, then exits
+  migrate:
+    image: ${ECR_REGISTRY}/todo-backend:latest
+    command: ["npm", "run", "db:setup"]
+    env_file: backend.env
+
+  backend:
+    image: ${ECR_REGISTRY}/todo-backend:latest
+    env_file: backend.env
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  frontend:
+    image: ${ECR_REGISTRY}/todo-frontend:latest
+    ports:
+      - "80:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
