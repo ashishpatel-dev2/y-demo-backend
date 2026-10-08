@@ -20,11 +20,10 @@ npm run dev                   # http://localhost:5000/api/health
 
 New migration: `npx sequelize-cli migration:generate --name <name>`, then rename the file to `.cjs`.
 
-## CI/CD (`.github/workflows/ci-cd.yml`)
+## CI (`.github/workflows/ci.yml`)
 
-- **Pull request / push:** lint → migrations → tests, against a throwaway PostgreSQL.
-- **Push to `main` (after tests pass):** build image → push to ECR `todo-backend`
-  (`:latest` and `:<commit sha>`) → run `deploy.sh backend` on the EC2 server via AWS SSM.
+On every pull request and push to `main`: lint → migrations → tests, against a
+throwaway PostgreSQL. (Deployment is not set up yet.)
 
-`deploy/` holds the server-side files (`docker-compose.yml`, `deploy.sh`,
-`backend.env.example`); they live in `/home/ubuntu/app` on the EC2 server.
+`deploy/` holds server-side files (`docker-compose.yml`, `deploy.sh`,
+`backend.env.example`) for a future EC2 deployment; CI doesn't use them.
