@@ -20,10 +20,12 @@ npm run dev                   # http://localhost:5000/api/health
 
 New migration: `npx sequelize-cli migration:generate --name <name>`, then rename the file to `.cjs`.
 
-## CI (`.github/workflows/ci.yml`)
+## CI/CD (`.github/workflows/ci-cd.yml`)
 
-On every pull request and push to `main`: lint → migrations → tests, against a
-throwaway PostgreSQL. (Deployment is not set up yet.)
+- **Pull request / push:** lint → migrations → tests, against a throwaway PostgreSQL.
+- **Push to `main` (after tests pass):** build image → push to ECR `todo-backend`
+  → register a new revision of [.aws/task-definition.json](.aws/task-definition.json)
+  → run migrations as a one-off ECS task → roll the ECS service `todo-backend-service`
+  over to the new revision and wait until it's healthy behind the load balancer.
 
-`deploy/` holds server-side files (`docker-compose.yml`, `deploy.sh`,
-`backend.env.example`) for a future EC2 deployment; CI doesn't use them.
+AWS setup: see `AWS-ECS-SETUP.md` in the parent folder.

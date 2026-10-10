@@ -1,0 +1,147 @@
+name: Backend CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  AWS_REGION: ap-south-1
+  ECR_REPOSITORY: todo-backend
+  ECS_CLUSTER: todo-cluster
+  ECS_SERVICE: todo-backend-service
+  CONTAINER_NAME: todo-backend
+  TASK_DEFINITION: .aws/task-definition.json
+
+jobs:
+  test:
+    name: Lint & test
+    runs-on: ubuntu-latest
+    # Throwaway PostgreSQL for the tests (and to check migrations run)
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DB_HOST: localhost
+      DB_PORT: 5432
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_NAME: todos
+      DB_SSL: "false"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - name: Run migrations
+        run: npm run db:setup
+      - run: npm test
+
+  deploy:
+    name: Deploy to ECS
+    needs: test
+    # Only deploy pushes to main, not pull requests
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    concurrency: deploy-backend
+    permissions:
+      id-token: write # lets GitHub log in to AWS with OIDC
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push image
+        id: image
+        env:
+          REPO: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}
+        run: |
+          IMAGE="$REPO:${{ github.sha }}"
+          docker build -t "$IMAGE" -t "$REPO:latest" .
+          docker push --all-tags "$REPO"
+          echo "uri=$IMAGE" >> "$GITHUB_OUTPUT"
+
+      - name: Register new task definition
+        id: taskdef
+        env:
+          IMAGE: ${{ steps.image.outputs.uri }}
+        run: |
+          # Point the task definition at the image we just pushed
+          jq --arg image "$IMAGE" '.containerDefinitions[0].image = $image' \
+            "$TASK_DEFINITION" > taskdef.json
+          ARN=$(aws ecs register-task-definition --cli-input-json file://taskdef.json \
+            --query taskDefinition.taskDefinitionArn --output text)
+          echo "Registered $ARN"
+          echo "arn=$ARN" >> "$GITHUB_OUTPUT"
+
+      - name: Run database migrations
+        env:
+          TASK_DEF: ${{ steps.taskdef.outputs.arn }}
+        run: |
+          # One-off task with the new image, running `npm run db:setup` instead
+          # of the server. It reuses the service's subnets and security group,
+          # so it can reach RDS just like the backend does.
+          NETWORK=$(aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" \
+            --query 'services[0].networkConfiguration' --output json)
+          OVERRIDES=$(jq -n --arg name "$CONTAINER_NAME" \
+            '{containerOverrides: [{name: $name, command: ["npm", "run", "db:setup"]}]}')
+          TASK=$(aws ecs run-task --cluster "$ECS_CLUSTER" --launch-type FARGATE \
+            --task-definition "$TASK_DEF" --network-configuration "$NETWORK" \
+            --overrides "$OVERRIDES" --query 'tasks[0].taskArn' --output text)
+          if [ "$TASK" = "None" ]; then
+            echo "::error::Could not start the migration task"
+            exit 1
+          fi
+          echo "Started migration task $TASK, waiting for it to finish..."
+          aws ecs wait tasks-stopped --cluster "$ECS_CLUSTER" --tasks "$TASK"
+
+          EXIT_CODE=$(aws ecs describe-tasks --cluster "$ECS_CLUSTER" --tasks "$TASK" \
+            --query 'tasks[0].containers[0].exitCode' --output text)
+          if [ "$EXIT_CODE" != "0" ]; then
+            aws ecs describe-tasks --cluster "$ECS_CLUSTER" --tasks "$TASK" \
+              --query 'tasks[0].{stoppedReason: stoppedReason, container: containers[0].reason}'
+            echo "::error::Migrations failed (exit code $EXIT_CODE). Logs: CloudWatch /ecs/todo-backend"
+            exit 1
+          fi
+          echo "Migrations done"
+
+      - name: Deploy to ECS service
+        env:
+          TASK_DEF: ${{ steps.taskdef.outputs.arn }}
+        run: |
+          aws ecs update-service --cluster "$ECS_CLUSTER" --service "$ECS_SERVICE" \
+            --task-definition "$TASK_DEF" --query 'service.serviceName' --output text
+          echo "Waiting for the new tasks to pass the load balancer health check..."
+          aws ecs wait services-stable --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE"
+
+          # If the new tasks kept failing, ECS rolls back to the previous
+          # version and the service is "stable" again, so check which won.
+          RUNNING=$(aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" \
+            --query 'services[0].taskDefinition' --output text)
+          if [ "$RUNNING" != "$TASK_DEF" ]; then
+            echo "::error::Deployment failed and ECS rolled back to $RUNNING. Logs: CloudWatch /ecs/todo-backend"
+            exit 1
+          fi
+          echo "Deployed $TASK_DEF"
